@@ -57,6 +57,10 @@ CREATE TABLE IF NOT EXISTS inflight_slots (
 CREATE INDEX IF NOT EXISTS idx_slots_source ON inflight_slots(source_base);
 CREATE INDEX IF NOT EXISTS idx_slots_worker ON inflight_slots(worker_id);
 
+-- 认领索引：按源挑一个 pending 项，避免全表扫描放大写事务（等待登记重试时
+-- 尤其重要：每次重试都要在最短时间内拿到写锁并让出）。
+CREATE INDEX IF NOT EXISTS idx_items_status_id ON items(status, id);
+
 -- 每个数据源的全局限速/冷却状态（跨进程共享，冷却持久化，重启不绕过）
 CREATE TABLE IF NOT EXISTS source_states (
     source_base   TEXT PRIMARY KEY,
@@ -66,13 +70,17 @@ CREATE TABLE IF NOT EXISTS source_states (
 """
 
 
-async def connect(db_path: str | None = None) -> aiosqlite.Connection:
+async def connect(
+    db_path: str | None = None, *, busy_timeout_ms: int | None = None
+) -> aiosqlite.Connection:
     path = db_path or str(config.COLLECTOR_DB)
+    if busy_timeout_ms is None:
+        busy_timeout_ms = config.DB_BUSY_TIMEOUT_MS
     conn = await aiosqlite.connect(path, isolation_level=None)
     conn.row_factory = aiosqlite.Row
     conn._ce_busy_timeout = True  # 标记，仅用于可读性
     await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("PRAGMA busy_timeout=10000")
+    await conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
     await conn.execute("PRAGMA synchronous=NORMAL")
     await conn.execute("PRAGMA foreign_keys=ON")
     return conn

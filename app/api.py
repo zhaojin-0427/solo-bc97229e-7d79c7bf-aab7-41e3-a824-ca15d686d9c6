@@ -9,7 +9,7 @@ import aiosqlite
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import config, db
+from . import config, coord, db
 
 MAX_ITEMS_PER_JOB = 20
 
@@ -66,7 +66,14 @@ class SourceStateOut(BaseModel):
     source_base: str
     last_started_at: float | None
     cooldown_until: float | None
+    cooldown_remaining: float | None = Field(
+        default=None, description="距冷却结束的剩余秒数，无冷却为 null"
+    )
     inflight: int
+    pending_registrations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="响应已返回、仍在等锁登记（尚未落库）的条目摘要",
+    )
     workers: list[dict[str, Any]]
 
 
@@ -81,10 +88,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="站点逐日降水采集 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交气象源地址与最多 20 组站号/日期，两个采集进程共享 SQLite 库，"
-        "按源限速（同源在途≤2、请求间隔≥1秒、429 冷却）逐项采集并入库。"
+        "按源限速（同源在途≤2、请求间隔≥1秒、429 冷却）逐项采集并入库。\n\n"
+        "响应登记遇到数据库写锁时不会丢弃响应或重新取源：采集进程会保留已到手的"
+        "响应并自动重试登记，其它进程在该响应登记完成前不会发出同源新请求；"
+        "429 冷却始终按收到响应的时刻起算。"
     ),
     lifespan=lifespan,
 )
@@ -228,29 +238,52 @@ async def job_items(job_id: int) -> list[ItemOut]:
 
 @app.get("/sources", response_model=list[SourceStateOut])
 async def source_states() -> list[SourceStateOut]:
-    """查看各源的在途数、最近请求开始时刻与剩余冷却，以及采集进程存活情况。"""
+    """查看各源的在途数、最近请求开始时刻、剩余冷却与待登记响应。"""
     conn = _conn()
-    rows = await db.fetchall(conn, 
+    rows = await db.fetchall(
+        conn,
         "SELECT s.source_base, s.last_started_at, s.cooldown_until, "
         "(SELECT COUNT(*) FROM inflight_slots k WHERE k.source_base=s.source_base) AS inflight "
-        "FROM source_states s ORDER BY s.source_base"
+        "FROM source_states s ORDER BY s.source_base",
     )
     workers = [
         dict(r)
-        for r in await db.fetchall(conn, 
-            "SELECT id, hostname, started_at, last_heartbeat, active FROM workers ORDER BY id"
+        for r in await db.fetchall(
+            conn,
+            "SELECT id, hostname, started_at, last_heartbeat, active FROM workers ORDER BY id",
         )
     ]
-    return [
-        SourceStateOut(
-            source_base=r["source_base"],
-            last_started_at=r["last_started_at"],
-            cooldown_until=r["cooldown_until"],
-            inflight=r["inflight"],
-            workers=workers,
+    now = time.time()
+    out: list[SourceStateOut] = []
+    for r in rows:
+        cooldown_until = r["cooldown_until"]
+        marks = coord.pending_marks(r["source_base"])
+        out.append(
+            SourceStateOut(
+                source_base=r["source_base"],
+                last_started_at=r["last_started_at"],
+                cooldown_until=cooldown_until,
+                cooldown_remaining=(
+                    max(0.0, cooldown_until - now) if cooldown_until else None
+                ),
+                inflight=r["inflight"],
+                pending_registrations=[
+                    {
+                        "item_id": m.get("item_id"),
+                        "kind": m.get("kind"),
+                        "worker": m.get("worker_token"),
+                        "received_at": m.get("received_at"),
+                        "retry_after": m.get("retry_after"),
+                        "waiting_seconds": round(
+                            now - float(m.get("marked_at", now)), 3
+                        ),
+                    }
+                    for m in marks
+                ],
+                workers=workers,
+            )
         )
-        for r in rows
-    ]
+    return out
 
 
 def _item_out(r: aiosqlite.Row) -> ItemOut:

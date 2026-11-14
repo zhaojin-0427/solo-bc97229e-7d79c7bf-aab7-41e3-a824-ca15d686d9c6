@@ -7,3 +7,6 @@ __pycache__/
 *.db-shm
 data/
 README.md
+requirements-dev.txt
+pytest.ini
+tests/
